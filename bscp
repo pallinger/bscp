@@ -18,6 +18,11 @@ import hashlib
 import struct
 import subprocess
 import sys
+try:
+    from tqdm import tqdm
+    tqdm_available=True
+except ImportError:
+    tqdm_available=False
 
 if sys.version_info < (3, 0):
     range = xrange
@@ -60,7 +65,9 @@ with open(filename, 'rb+') as f:
     stdout_buffer.write(struct.pack('<Q', f.tell()))
     readremain = size
     rblocksize = blocksize
+    hash_total = hashlib.new(hashname)
     f.seek(0)
+    br=False
     while True:
         if readremain <= blocksize:
             rblocksize = readremain
@@ -68,33 +75,27 @@ with open(filename, 'rb+') as f:
         if len(block) == 0:
             break
         digest = hashlib.new(hashname, block).digest()
+        hash_total.update(digest)
         stdout_buffer.write(digest)
         readremain -= rblocksize
         if readremain == 0:
-            break
-    stdout_buffer.flush()
-    while True:
+            br=True
+        stdout_buffer.flush()
+
         position_s = stdin_buffer.read(8)
         if len(position_s) == 0:
             break
         (position,) = struct.unpack('<Q', position_s)
+        # detect magic number to indicating that transfer is unnecessary
+        if position == 9223372036854775808:
+            continue
         block = stdin_buffer.read(blocksize)
         f.seek(position)
         f.write(block)
+        if br==True:
+            break
     readremain = size
     rblocksize = blocksize
-    hash_total = hashlib.new(hashname)
-    f.seek(0)
-    while True:
-        if readremain <= blocksize:
-            rblocksize = readremain
-        block = f.read(rblocksize)
-        if len(block) == 0:
-            break
-        hash_total.update(block)
-        readremain -= rblocksize
-        if readremain == 0:
-            break
 stdout_buffer.write(hash_total.digest())
 '''
 
@@ -143,29 +144,44 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname):
             raise RuntimeError('Remote script failed to execute properly')
         io.write(b'go')
 
+        print("starting transfer")
         (remote_size,) = struct.unpack('<Q', io.read(8))
         if remote_size < size:
             raise RuntimeError('Remote size less than local (local: %i, remote: %i)' % (size, remote_size))
-        remote_digest_list = [io.read(hash_total.digest_size) for i in range(blockcount)]
+        if tqdm_available:
+            t=tqdm(total=size, mininterval=1, unit='B', unit_scale=1)
+        sent=0
+        notsent=0
+        for i in range(blockcount):
+            remote_digest = io.read(hash_total.digest_size)
 
-        for remote_digest in remote_digest_list:
             position = f.tell()
             block = f.read(blocksize)
-            hash_total.update(block)
             digest = hashlib.new(hashname, block).digest()
+            hash_total.update(digest)
             if digest != remote_digest:
                 try:
                     io.write(struct.pack('<Q', position))
                     io.write(block)
                 except IOError:
                     break
+                sent+=blocksize
+            else:
+                # use magic number to indicate that transfer is unnecessary
+                io.write(struct.pack('<Q', 9223372036854775808))
+                notsent+=blocksize
+
+            if tqdm_available:
+                t.update(blocksize)
         p.stdin.close()
+        if tqdm_available:
+            t.close()
 
         remote_digest_total = io.read()
         p.wait()
         if remote_digest_total != hash_total.digest():
             raise RuntimeError('Checksum mismatch after transfer')
-    return (io.in_total, io.out_total, size)
+    return (io.in_total, io.out_total, size, sent, notsent)
 
 if __name__ == '__main__':
     try:
@@ -184,6 +200,6 @@ if __name__ == '__main__':
         usage = 'bscp SRC HOST:DEST [BLOCKSIZE] [HASH]'
         sys.stderr.write('Usage:\n\n    %s\n\n' % (usage,))
         sys.exit(1)
-    (in_total, out_total, size) = bscp(local_filename, remote_host, remote_filename, blocksize, hashname)
+    (in_total, out_total, size, sent, notsent) = bscp(local_filename, remote_host, remote_filename, blocksize, hashname)
     speedup = size * 1.0 / (in_total + out_total)
-    sys.stderr.write('in=%i out=%i size=%i speedup=%.2f\n' % (in_total, out_total, size, speedup))
+    sys.stderr.write('in=%i out=%i size=%i speedup=%.2f\n  net_sent=%i net_skipped=%i' % (in_total, out_total, size, speedup, sent, notsent))
