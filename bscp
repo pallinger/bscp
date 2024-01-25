@@ -75,7 +75,6 @@ with open(filename, 'rb+') as f:
         if len(block) == 0:
             break
         digest = hashlib.new(hashname, block).digest()
-        hash_total.update(digest)
         stdout_buffer.write(digest)
         readremain -= rblocksize
         if readremain == 0:
@@ -88,10 +87,12 @@ with open(filename, 'rb+') as f:
         (position,) = struct.unpack('<Q', position_s)
         # detect magic number to indicating that transfer is unnecessary
         if position == 9223372036854775808:
+            hash_total.update(digest)
             continue
         block = stdin_buffer.read(blocksize)
         f.seek(position)
         f.write(block)
+        hash_total.update(hashlib.new(hashname, block).digest())
         if br==True:
             break
     readremain = size
